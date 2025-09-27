@@ -1432,6 +1432,73 @@ def compute_tauc_alpha_bandgap(
     return bandgap_df, tauc_curves, fit_params, detailed_data
 
 
+def fit_tauc_line(
+    energies: np.ndarray,
+    tauc_values: np.ndarray,
+    method: str = 'auto',
+    threshold_fraction: float = 0.1,
+    energy_window: Optional[Tuple[float, float]] = None,
+    min_points: int = 2,
+) -> Tuple[float, float, float, float, np.ndarray]:
+    """
+    Fit a straight line to the Tauc curve and return fit parameters and diagnostics.
+
+    Returns (slope, intercept, Eg, R2, used_mask)
+    """
+    # Ensure numpy arrays
+    E = np.array(energies, dtype=float)
+    Y = np.array(tauc_values, dtype=float)
+    used = np.isfinite(E) & np.isfinite(Y)
+    if energy_window is not None:
+        lo, hi = energy_window
+        used &= (E >= lo) & (E <= hi)
+    if not np.any(used):
+        return np.nan, np.nan, np.nan, np.nan, used
+    E_used = E[used]
+    Y_used = Y[used]
+    # Automatic selection by threshold
+    if method == 'auto':
+        try:
+            max_val = np.nanmax(Y_used)
+            threshold = threshold_fraction * max_val
+            mask_thr = Y_used >= threshold
+            if np.sum(mask_thr) < min_points:
+                # fallback: top half of points by Y magnitude
+                order = np.argsort(Y_used)[::-1]
+                take = max(min_points, len(Y_used) // 2)
+                idx = order[:take]
+                sel = np.zeros_like(Y_used, dtype=bool)
+                sel[idx] = True
+            else:
+                sel = mask_thr
+        except Exception:
+            sel = np.ones_like(Y_used, dtype=bool)
+    else:
+        # manual: use all points in E_used (caller applies window)
+        sel = np.ones_like(Y_used, dtype=bool)
+    if np.sum(sel) < min_points:
+        return np.nan, np.nan, np.nan, np.nan, used
+    x = E_used[sel]
+    y = Y_used[sel]
+    try:
+        coeffs = np.polyfit(x, y, 1)
+        slope, intercept = float(coeffs[0]), float(coeffs[1])
+        y_pred = slope * x + intercept
+        ss_res = np.sum((y - y_pred) ** 2)
+        ss_tot = np.sum((y - np.mean(y)) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else np.nan
+        Eg = -intercept / slope if slope != 0 and slope > 0 else np.nan
+    except Exception:
+        slope, intercept, Eg, r2 = np.nan, np.nan, np.nan, np.nan
+    # Build final used mask in the original E array
+    used_mask = np.zeros_like(used, dtype=bool)
+    # Map sel indices back to used positions
+    used_indices = np.where(used)[0]
+    selected_indices = used_indices[np.where(sel)[0]]
+    used_mask[selected_indices] = True
+    return slope, intercept, Eg, r2, used_mask
+
+
 def plot_tauc_curve(
     tauc_df: pd.DataFrame,
     sample: str,
@@ -2147,9 +2214,18 @@ def main() -> None:
                     fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=int(dpi))
                     cmap = plt.get_cmap(tauc_cmap)
                     colours = cmap(np.linspace(0, 1, max(len(chosen_plot_samples), 1)))
+                    # Prepare fit storage
+                    if 'tauc_fits' not in st.session_state:
+                        st.session_state['tauc_fits'] = {}
+                    fit_method = st.sidebar.selectbox('Fit method', options=['Automatic', 'Manual'], index=0, key='tauc_fit_method')
+                    threshold_fraction = st.sidebar.slider('Threshold fraction (auto)', min_value=0.01, max_value=0.5, value=0.1, step=0.01, key='tauc_threshold')
+                    manual_e_min = st.sidebar.number_input('Manual fit E min (eV)', value=float(0.5), step=0.01, key='tauc_manual_min')
+                    manual_e_max = st.sidebar.number_input('Manual fit E max (eV)', value=float(3.5), step=0.01, key='tauc_manual_max')
+                    show_fit_lines = st.sidebar.checkbox('Show fit lines', value=True, key='tauc_show_fit')
+                    show_eg = st.sidebar.checkbox('Show E_g annotations', value=True, key='tauc_show_eg')
                     for idx, s in enumerate(chosen_plot_samples):
                         df_t = tauc_tables_local[s]
-                        plot_df = df_t.dropna(subset=['Energy (eV)', 'Alpha_hv_n'])
+                        plot_df = df_t.dropna(subset=['Energy (eV)', 'Alpha_hv_n']).reset_index(drop=True)
                         if plot_df.empty:
                             continue
                         ax.plot(
@@ -2161,6 +2237,23 @@ def main() -> None:
                             linewidth=float(tauc_line_width),
                             marker=(None if (tauc_marker == 'None') else tauc_marker),
                         )
+                        # Fit
+                        energies_arr = plot_df['Energy (eV)'].values
+                        y_arr = plot_df['Alpha_hv_n'].values
+                        if fit_method == 'Automatic':
+                            slope, intercept, Eg, r2, used_mask = fit_tauc_line(energies_arr, y_arr, method='auto', threshold_fraction=float(threshold_fraction))
+                        else:
+                            slope, intercept, Eg, r2, used_mask = fit_tauc_line(energies_arr, y_arr, method='manual', energy_window=(manual_e_min, manual_e_max))
+                        st.session_state['tauc_fits'][s] = {'slope': slope, 'intercept': intercept, 'Eg': Eg, 'R2': r2, 'used_mask': used_mask}
+                        # Draw fit line and Eg marker
+                        if show_fit_lines and np.isfinite(slope) and np.isfinite(intercept):
+                            # Evaluate fit line across plotted energy range
+                            xfit = np.linspace(np.nanmin(energies_arr), np.nanmax(energies_arr), 100)
+                            yfit = slope * xfit + intercept
+                            ax.plot(xfit, yfit, linestyle='--', color='red', linewidth=1.2)
+                        if show_eg and np.isfinite(Eg):
+                            ax.axvline(Eg, color='k', linestyle=':', linewidth=1.0)
+                            ax.text(Eg, 0.95 * np.nanmax(plot_df['Alpha_hv_n']), f'Eg={Eg:.3f} eV', rotation=90, va='top', ha='center', bbox=dict(facecolor='white', alpha=0.7, lw=0))
                     ax.set_xlabel('Photon energy E (eV)')
                     ax.set_ylabel(f'(α·hν)^{{{tauc_exponent}}} (a.u.)')
                     ax.set_title('Tauc plot overlay')
