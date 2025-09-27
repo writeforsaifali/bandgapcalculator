@@ -18,7 +18,7 @@ avoids the need to run ``streamlit run`` manually from the command
 line. To use this feature you must have the ``streamlit`` package
 installed in your Python environment.
 
-Author: Adapted for Streamlit by ChatGPT
+Author: Saif Ali <sali@unisa.it>
 """
 
 from __future__ import annotations
