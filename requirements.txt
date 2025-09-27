@@ -1,10 +1,10 @@
-streamlit
-matplotlib
-scipy
-pandas
-numpy
-openpyxl
+streamlit>=1.24.0
+matplotlib>=3.7.1
+scipy>=1.10.1
+pandas>=2.0.3
+numpy>=1.24.3
+openpyxl>=3.1.2
 
 # Optional but helpful
-seaborn
-scikit-learn
+seaborn>=0.12.2
+scikit-learn>=1.2.2
