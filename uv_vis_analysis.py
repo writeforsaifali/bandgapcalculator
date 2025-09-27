@@ -29,8 +29,35 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter, find_peaks
+
+# Optional plotting and signal-processing libraries. These are required
+# for full functionality; on environments like Streamlit Cloud they must
+# be present in requirements.txt. We import them with guarded
+# try/except blocks so that the module can be loaded and we can show a
+# helpful message to users instead of a ModuleNotFoundError traceback.
+try:
+    import matplotlib
+    # Use a non-interactive backend suitable for headless environments
+    try:
+        matplotlib.use('Agg')
+    except Exception:
+        # If backend selection fails, continue — pyplot import may still work
+        pass
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover - environment dependent
+    plt = None
+
+try:
+    from scipy.signal import savgol_filter, find_peaks
+except Exception:  # pragma: no cover - environment dependent
+    # Provide lightweight fallbacks to avoid NameError later. The
+    # fallbacks are minimal and will raise at runtime if used; the
+    # Streamlit UI will instruct users to install scipy instead.
+    def savgol_filter(x, window_length, polyorder):
+        raise RuntimeError('scipy is required for smoothing. Please install scipy.')
+
+    def find_peaks(*args, **kwargs):
+        raise RuntimeError('scipy is required for peak finding. Please install scipy.')
 
 import streamlit as st
 
@@ -225,7 +252,7 @@ def plot_lines(
     show_grid: bool = True,
     figsize: Tuple[float, float] = (10, 6),
     dpi: int = 150,
-) -> plt.Figure:
+) -> Any:
     """Create a multi‑line plot for a given measurement across samples.
 
     This function is an extended version of the original ``plot_lines``
@@ -1371,7 +1398,7 @@ def plot_tauc_curve(
     show_grid: bool,
     figsize: Tuple[float, float],
     dpi: int,
-) -> plt.Figure:
+) -> Any:
     """
     Create a Tauc plot figure for a single sample with optional linear fit
     line and band gap annotation.
@@ -1451,6 +1478,41 @@ def plot_tauc_curve(
 def main() -> None:
     """Entry point for the Streamlit UV‑Vis analysis app."""
     st.set_page_config(page_title='UV‑Vis Analysis', layout='wide')
+    # Verify that plotting backends are available. If not, show a clear
+    # message and provide guidance to add missing packages to
+    # `requirements.txt` in the repository (Streamlit Cloud will install
+    # packages listed there on deploy).
+    missing_pkgs: List[str] = []
+    if plt is None:
+        missing_pkgs.append('matplotlib')
+    # If scipy's functions are the fallback wrappers defined above they
+    # will raise RuntimeError at use; detect absence by checking the
+    # module presence instead.
+    try:
+        import scipy  # type: ignore
+    except Exception:
+        missing_pkgs.append('scipy')
+    if missing_pkgs:
+        st.title('UV‑Vis Spectroscopy Analysis')
+        st.error(
+            'The application is missing required Python packages: '
+            + ', '.join(missing_pkgs)
+            + '.\nPlease add them to `requirements.txt` and redeploy/restart the app.'
+        )
+        st.markdown(
+            """
+            Suggested `requirements.txt` entries:
+            ```
+            matplotlib
+            scipy
+            streamlit
+            pandas
+            numpy
+            openpyxl
+            ```
+            """
+        )
+        return
     st.title('UV‑Vis Spectroscopy Analysis')
 
     st.markdown(
@@ -1693,7 +1755,7 @@ def main() -> None:
         st.markdown('---')
         # Generate and display requested plots with customisation
         # Each plot is accompanied by a download button for high‑resolution output
-        def display_and_download(fig: plt.Figure, plot_name: str):
+        def display_and_download(fig: Any, plot_name: str):
             """Helper to display a figure and provide a download button."""
             st.pyplot(fig)
             buf = io.BytesIO()
