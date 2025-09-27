@@ -2341,6 +2341,7 @@ def main() -> None:
                     if 'tauc_fits' not in st.session_state:
                         st.session_state['tauc_fits'] = {}
                     fit_method = st.sidebar.selectbox('Fit method', options=['Automatic', 'Manual'], index=0, key='tauc_fit_method')
+                    transition_choice = st.sidebar.selectbox('Transition type', options=['Auto', 'Direct (n=2)', 'Indirect (n=0.5)'], index=0, key='tauc_transition')
                     threshold_fraction = st.sidebar.slider('Threshold fraction (auto)', min_value=0.01, max_value=0.5, value=0.1, step=0.01, key='tauc_threshold')
                     # Manual selection sliders (Option C.1)
                     e_min_slider, e_max_slider = st.sidebar.slider('Manual energy window (eV)', min_value=float(0.0), max_value=float(6.0), value=(0.5, 3.5), step=0.01, key='tauc_manual_slider')
@@ -2348,38 +2349,81 @@ def main() -> None:
                     manual_e_max = st.sidebar.number_input('Manual fit E max (eV)', value=float(e_max_slider), step=0.01, key='tauc_manual_max')
                     show_fit_lines = st.sidebar.checkbox('Show fit lines', value=True, key='tauc_show_fit')
                     show_eg = st.sidebar.checkbox('Show E_g annotations', value=True, key='tauc_show_eg')
+                    # We'll collect traces for Plotly as well
+                    plotly_traces = []
                     for idx, s in enumerate(chosen_plot_samples):
                         df_t = tauc_tables_local[s]
-                        plot_df = df_t.dropna(subset=['Energy (eV)', 'Alpha_hv_n']).reset_index(drop=True)
+                        plot_df = df_t.dropna(subset=['Energy (eV)', 'Alpha_hv']).reset_index(drop=True)
                         if plot_df.empty:
                             continue
+                        energies_arr = plot_df['Energy (eV)'].values
+                        base_vals = plot_df['Alpha_hv'].values
+
+                        def compute_and_fit(exp: float):
+                            # Safely compute y = (alpha*E)^n
+                            with np.errstate(invalid='ignore'):
+                                yvals = np.power(base_vals, exp)
+                            # Choose method
+                            if fit_method == 'Automatic':
+                                s, b, eg, r2v, used = fit_tauc_line(energies_arr, yvals, method='auto', threshold_fraction=float(threshold_fraction))
+                            else:
+                                s, b, eg, r2v, used = fit_tauc_line(energies_arr, yvals, method='manual', energy_window=(manual_e_min, manual_e_max))
+                            return {'exp': exp, 'slope': s, 'intercept': b, 'Eg': eg, 'R2': r2v, 'used': used, 'y': yvals}
+
+                        # Candidate exponents
+                        if transition_choice == 'Direct (n=2)':
+                            exps = [2.0]
+                        elif transition_choice == 'Indirect (n=0.5)':
+                            exps = [0.5]
+                        else:
+                            exps = [2.0, 0.5]
+
+                        best = None
+                        best_score = -np.inf
+                        for e in exps:
+                            res = compute_and_fit(e)
+                            score = -np.inf
+                            if np.isfinite(res['slope']) and res['slope'] > 0:
+                                score = float(res.get('R2', -np.inf))
+                            else:
+                                score = float(res.get('R2', -np.inf)) - 1.0
+                            if res is not None and score > best_score:
+                                best = res
+                                best_score = score
+
+                        if best is None:
+                            continue
+                        sel_y = best['y']
+                        sel_used = best['used']
+                        slope = best['slope']
+                        intercept = best['intercept']
+                        Eg = best['Eg']
+                        r2 = best['R2']
+                        chosen_exp = best['exp']
+
+                        # Plot Matplotlib curve (use raw y, same as plotly)
                         ax.plot(
-                            plot_df['Energy (eV)'],
-                            plot_df['Alpha_hv_n'],
-                            label=s,
+                            energies_arr,
+                            sel_y,
+                            label=f"{s} (n={chosen_exp})",
                             color=colours[idx % len(colours)],
                             linestyle=line_style,
                             linewidth=float(tauc_line_width),
                             marker=(None if (tauc_marker == 'None') else tauc_marker),
                         )
-                        # Fit
-                        energies_arr = plot_df['Energy (eV)'].values
-                        y_arr = plot_df['Alpha_hv_n'].values
-                        if fit_method == 'Automatic':
-                            slope, intercept, Eg, r2, used_mask = fit_tauc_line(energies_arr, y_arr, method='auto', threshold_fraction=float(threshold_fraction))
-                        else:
-                            # Manual: respect the slider/inputs
-                            slope, intercept, Eg, r2, used_mask = fit_tauc_line(energies_arr, y_arr, method='manual', energy_window=(manual_e_min, manual_e_max))
-                        st.session_state['tauc_fits'][s] = {'slope': slope, 'intercept': intercept, 'Eg': Eg, 'R2': r2, 'used_mask': used_mask}
+                        # Store fit info
+                        st.session_state['tauc_fits'][s] = {'slope': slope, 'intercept': intercept, 'Eg': Eg, 'R2': r2, 'used_mask': sel_used, 'n': chosen_exp}
                         # Draw fit line and Eg marker
                         if show_fit_lines and np.isfinite(slope) and np.isfinite(intercept):
-                            # Evaluate fit line across plotted energy range
                             xfit = np.linspace(np.nanmin(energies_arr), np.nanmax(energies_arr), 100)
                             yfit = slope * xfit + intercept
                             ax.plot(xfit, yfit, linestyle='--', color='red', linewidth=1.2)
                         if show_eg and np.isfinite(Eg):
                             ax.axvline(Eg, color='k', linestyle=':', linewidth=1.0)
-                            ax.text(Eg, 0.95 * np.nanmax(plot_df['Alpha_hv_n']), f'Eg={Eg:.3f} eV', rotation=90, va='top', ha='center', bbox=dict(facecolor='white', alpha=0.7, lw=0))
+                            ax.text(Eg, 0.95 * np.nanmax(sel_y), f'Eg={Eg:.3f} eV', rotation=90, va='top', ha='center', bbox=dict(facecolor='white', alpha=0.7, lw=0))
+
+                        # Prepare plotly trace
+                        plotly_traces.append((s, energies_arr, sel_y, colours[idx % len(colours)], chosen_exp, sel_used, slope, intercept, Eg, r2))
                     ax.set_xlabel('Photon energy E (eV)')
                     ax.set_ylabel(f'(α·hν)^{{{tauc_exponent}}} (a.u.)')
                     ax.set_title('Tauc plot overlay')
@@ -2396,17 +2440,23 @@ def main() -> None:
                         ax.set_ylim(float(tauc_ymin), float(tauc_ymax))
                     # If Plotly is available, provide an interactive preview for manual selection
                     if go is not None and px is not None:
-                        # Build a Plotly figure mirroring the Matplotlib one but interactive
+                        # Build a Plotly figure using the selected traces (interactive)
                         plotly_fig = go.Figure()
-                        for idx, s in enumerate(chosen_plot_samples):
-                            df_t = tauc_tables_local[s].dropna(subset=['Energy (eV)', 'Alpha_hv_n']).reset_index(drop=True)
-                            if df_t.empty:
-                                continue
-                            plotly_fig.add_trace(go.Scatter(x=df_t['Energy (eV)'], y=df_t['Alpha_hv_n'], mode='lines+markers' if tauc_marker!='None' else 'lines', name=s, line=dict(color='rgba'+str(tuple((colours[idx%len(colours)].tolist()))) )))
+                        for i, trace in enumerate(plotly_traces):
+                            (sname, xarr, yarr, colour, chosen_exp, used_mask, slope, intercept, Eg_v, r2_v) = trace
+                            # main line
+                            plotly_fig.add_trace(go.Scatter(x=xarr, y=yarr, mode='lines+markers' if tauc_marker!='None' else 'lines', name=f'{sname} (n={chosen_exp})', line=dict(color=matplotlib.colors.to_hex(colour))))
+                            # highlight fitted points
+                            if np.any(used_mask):
+                                plotly_fig.add_trace(go.Scatter(x=xarr[used_mask], y=yarr[used_mask], mode='markers', name=f'{sname} fit region', marker=dict(color=matplotlib.colors.to_hex(colour), size=6, symbol='circle-open')))
+                            # Eg vertical line
+                            if np.isfinite(Eg_v):
+                                plotly_fig.add_vline(x=Eg_v, line=dict(color=matplotlib.colors.to_hex(colour), dash='dot'))
+                                plotly_fig.add_annotation(x=Eg_v, y=max(np.nanmax(yarr), 0.0), text=f'Eg={Eg_v:.3f} eV', showarrow=False, yanchor='bottom', textangle=-90)
                         # Highlight selected manual window if Manual mode
                         if fit_method != 'Automatic':
-                            plotly_fig.add_vrect(x0=manual_e_min, x1=manual_e_max, fillcolor='LightSalmon', opacity=0.2, layer='below', line_width=0)
-                        plotly_fig.update_layout(title='Tauc plot (interactive preview)', xaxis_title='Photon energy (eV)', yaxis_title=f'(α·hν)^{{{tauc_exponent}}} (a.u.)')
+                            plotly_fig.add_vrect(x0=manual_e_min, x1=manual_e_max, fillcolor='LightSalmon', opacity=0.15, layer='below', line_width=0)
+                        plotly_fig.update_layout(title='Tauc plot (interactive preview)', xaxis_title='Photon energy (eV)', yaxis_title='(α·hν)^{n} (a.u.)', legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1))
                         st.plotly_chart(plotly_fig, use_container_width=True)
                     else:
                         st.pyplot(fig)
