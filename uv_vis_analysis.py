@@ -1936,6 +1936,126 @@ def main() -> None:
             display_and_download(fig, 'Second_Derivative')
 
         # ------------------------------------------------------------------
+        # Tauc plotting: overlay (α·hν)^n vs E for selected samples
+        # ------------------------------------------------------------------
+        # Sidebar controls for Tauc plot (only show if user enabled Tauc)
+        if show_tauc:
+            st.sidebar.markdown('---')
+            st.sidebar.subheader('Tauc plot customisation')
+            tauc_auto_fit = st.sidebar.checkbox('Auto-fit axes', value=True, key='tauc_auto_fit')
+            tauc_xmin = st.sidebar.number_input('Tauc X min (eV)', value=0.5, step=0.1, key='tauc_xmin')
+            tauc_xmax = st.sidebar.number_input('Tauc X max (eV)', value=4.0, step=0.1, key='tauc_xmax')
+            tauc_ymin = st.sidebar.number_input('Tauc Y min (a.u.)', value=0.0, step=0.1, key='tauc_ymin')
+            tauc_ymax = st.sidebar.number_input('Tauc Y max (a.u.)', value=1.0, step=0.1, key='tauc_ymax')
+            tauc_cmap = st.sidebar.selectbox('Tauc colour map', options=colormap_options, index=0, key='tauc_cmap')
+            tauc_line_style = st.sidebar.selectbox('Tauc line style', options=list(line_style_options.keys()), index=0, key='tauc_line_style')
+            tauc_marker = st.sidebar.selectbox('Tauc marker', options=marker_options, index=0, key='tauc_marker')
+            tauc_line_width = st.sidebar.slider('Tauc line width', min_value=0.5, max_value=4.0, value=1.2, step=0.1, key='tauc_line_width')
+
+            # Build or retrieve per-sample computed tables in session_state
+            if 'tauc_tables' not in st.session_state:
+                st.session_state['tauc_tables'] = {}
+            # When we displayed per-sample tables above we computed display_df but did not store; reconstruct now
+            # We'll compute tauc_table for every selected sample based on merged_data and stored choices
+            tauc_tables_local: Dict[str, pd.DataFrame] = {}
+            for s in selected_samples:
+                # Only include samples user marked in selected_for_tauc
+                use_key = f'use_{s}'
+                if use_key in st.session_state and not st.session_state[use_key]:
+                    continue
+                # Determine measurement choice key
+                meas_key = f'meas_{s}'
+                thick_key = f'thick_{s}'
+                if meas_key not in st.session_state:
+                    continue
+                chosen = st.session_state[meas_key]
+                thickness_nm = st.session_state.get(thick_key, 0.0)
+                # Retrieve measurement series robustly
+                try:
+                    if any(isinstance(c, tuple) for c in merged_data.columns):
+                        meas_series = merged_data[(s, chosen)].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
+                    else:
+                        meas_series = merged_data[f'{s} {chosen}'].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
+                except Exception:
+                    meas_series = pd.Series([np.nan] * len(wavelengths))
+                # Detect percent vs fraction
+                meas_median = pd.Series(meas_series).abs().median(skipna=True)
+                if pd.notna(meas_median) and meas_median > 1.5:
+                    meas_frac = meas_series / 100.0
+                else:
+                    meas_frac = meas_series.copy()
+                meas_frac = meas_frac.where(meas_frac > 0, np.nan)
+                # Compute alpha
+                if thickness_nm and thickness_nm > 0:
+                    d_m = thickness_nm * 1e-9
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        alpha_vals = -np.log(meas_frac) / d_m
+                else:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        alpha_vals = -np.log(meas_frac)
+                energies_full = 1240.0 / pd.to_numeric(wavelengths)
+                alpha_s = pd.Series(alpha_vals).reset_index(drop=True)
+                energy_s = pd.Series(energies_full).reset_index(drop=True)
+                with np.errstate(invalid='ignore'):
+                    alpha_hv = alpha_s * energy_s
+                    alpha_hv_n = np.power(alpha_hv, tauc_exponent)
+                df_t = pd.DataFrame({
+                    'Wavelength (nm)': wavelengths,
+                    'Energy (eV)': energy_s,
+                    'Alpha': alpha_s,
+                    'Alpha_hv': alpha_hv,
+                    f'Alpha_hv_n': alpha_hv_n,
+                })
+                tauc_tables_local[s] = df_t
+                st.session_state['tauc_tables'][s] = df_t
+
+            # If there are tables to plot, build an overlay plot
+            if tauc_tables_local:
+                # Allow user to select which samples to overlay (fallback to session selected)
+                plot_samples = sorted(list(tauc_tables_local.keys()))
+                chosen_plot_samples = st.multiselect('Samples to plot (overlay)', options=plot_samples, default=plot_samples, key='tauc_plot_samples')
+                if chosen_plot_samples:
+                    # Create figure
+                    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=int(dpi))
+                    cmap = plt.get_cmap(tauc_cmap)
+                    colours = cmap(np.linspace(0, 1, max(len(chosen_plot_samples), 1)))
+                    for idx, s in enumerate(chosen_plot_samples):
+                        df_t = tauc_tables_local[s]
+                        # Drop NaNs
+                        plot_df = df_t.dropna(subset=['Energy (eV)', 'Alpha_hv_n'])
+                        if plot_df.empty:
+                            continue
+                        ax.plot(
+                            plot_df['Energy (eV)'],
+                            plot_df['Alpha_hv_n'],
+                            label=s,
+                            color=colours[idx % len(colours)],
+                            linestyle=line_style,
+                            linewidth=float(tauc_line_width),
+                            marker=(None if (tauc_marker == 'None') else tauc_marker),
+                        )
+                    ax.set_xlabel('Photon energy E (eV)')
+                    ax.set_ylabel(f'(α·hν)^{{{tauc_exponent}}} (a.u.)')
+                    ax.set_title('Tauc plot overlay')
+                    ax.grid(True)
+                    ax.legend()
+                    # Axis autoscale or custom
+                    if tauc_auto_fit:
+                        try:
+                            ax.relim()
+                            ax.autoscale_view()
+                        except Exception:
+                            pass
+                    else:
+                        ax.set_xlim(float(tauc_xmin), float(tauc_xmax))
+                        ax.set_ylim(float(tauc_ymin), float(tauc_ymax))
+                    st.pyplot(fig)
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png', dpi=int(dpi))
+                    buf.seek(0)
+                    st.download_button('Download Tauc overlay (PNG)', data=buf.getvalue(), file_name='tauc_overlay.png', mime='image/png')
+
+        # ------------------------------------------------------------------
         # Band gap data preview (tables, no plotting)
         # For each selected sample show a table with wavelength, the chosen
         # measurement column (e.g. %T or %R), computed alpha (or F(R)) and
