@@ -1951,6 +1951,10 @@ def main() -> None:
                 If thickness is left as 0 the table will show -ln(T) (unitless).
                 """
             )
+            # Let user choose direct or indirect bandgap exponent
+            st.info('Choose bandgap type for computing (αhν)^n')
+            bg_type = st.radio('Bandgap type', options=['Direct (n=2)', 'Indirect (n=0.5)'], index=0)
+            tauc_exponent = 2.0 if 'Direct' in bg_type else 0.5
             selected_for_tauc: List[str] = []
             # Locate wavelength column robustly. merged_data may be the flat
             # DataFrame produced by process_data (string column 'Wavelength (nm)')
@@ -2007,17 +2011,25 @@ def main() -> None:
                     is_trans = any(tok in name_lower for tok in ['%t', 't%', 'trans', 'transmittance', 'transmission'])
                     is_refl = any(tok in name_lower for tok in ['%r', 'r%', 'reflect', 'reflectance'])
                     if is_trans:
-                        meas_frac = meas_series / 100.0
+                        # Detect whether transmission values are in percent (0-100)
+                        # or in fraction (0-1). Use a heuristic: if values > 1.5 -> percent.
+                        meas_median = pd.Series(meas_series).abs().median(skipna=True)
+                        if pd.notna(meas_median) and meas_median > 1.5:
+                            meas_frac = meas_series / 100.0
+                            meas_format = 'percent'
+                        else:
+                            meas_frac = meas_series.copy()
+                            meas_format = 'fraction'
                         meas_frac = meas_frac.where(meas_frac > 0, np.nan)
                         if thickness_nm and thickness_nm > 0:
                             d_m = thickness_nm * 1e-9
                             with np.errstate(divide='ignore', invalid='ignore'):
                                 alpha_vals = -np.log(meas_frac) / d_m
-                            alpha_name = 'Absorption coefficient (1/m)'
+                            alpha_name = 'α (1/m) — α = -ln(T)/d'
                         else:
                             with np.errstate(divide='ignore', invalid='ignore'):
                                 alpha_vals = -np.log(meas_frac)
-                            alpha_name = '-ln(T) (unitless)'
+                            alpha_name = 'α (unitless) — α = -ln(T)'
                     elif is_refl:
                         R = meas_series / 100.0
                         R_safe = R.where(R > 0, np.nan)
@@ -2029,14 +2041,31 @@ def main() -> None:
                         alpha_name = 'Value'
                     with np.errstate(divide='ignore', invalid='ignore'):
                         energy = 1240.0 / wavelengths
+                    # Compute alpha*hν and (alpha*hν)^n for all rows
+                    # Ensure alpha_vals and energy are aligned as Series
+                    alpha_s = pd.Series(alpha_vals).reset_index(drop=True)
+                    energy_s = pd.Series(energy).reset_index(drop=True)
+                    with np.errstate(invalid='ignore'):
+                        alpha_hv = alpha_s * energy_s
+                        alpha_hv_n = np.power(alpha_hv, tauc_exponent)
+
+                    # Add a column indicating whether input T was percent or fraction when applicable
+                    meta_cols = {}
+                    if is_trans:
+                        meta_cols['Transmittance format'] = meas_format
+
                     display_df = pd.DataFrame({
                         'Wavelength (nm)': wavelengths,
                         chosen: meas_series,
-                        alpha_name: pd.Series(alpha_vals).reset_index(drop=True),
-                        'Energy (eV)': energy,
+                        'Transmittance format': meta_cols.get('Transmittance format', ''),
+                        alpha_name: alpha_s,
+                        'α·hν': alpha_hv,
+                        f'(α·hν)^{tauc_exponent}': alpha_hv_n,
+                        'Energy (eV)': energy_s,
                     })
                     st.write('Preview table (first 200 rows):')
-                    st.dataframe(display_df.head(200))
+                    # Show the full computed table as requested (not limited)
+                    st.dataframe(display_df)
                     csv_buf = io.StringIO()
                     display_df.to_csv(csv_buf, index=False)
                     st.download_button(label=f'Download computed table for {s} (CSV)', data=csv_buf.getvalue(), file_name=f'computed_{s}.csv', mime='text/csv', key=f'dl_{s}')
