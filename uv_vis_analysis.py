@@ -1448,54 +1448,162 @@ def fit_tauc_line(
     # Ensure numpy arrays
     E = np.array(energies, dtype=float)
     Y = np.array(tauc_values, dtype=float)
-    used = np.isfinite(E) & np.isfinite(Y)
+    valid = np.isfinite(E) & np.isfinite(Y)
     if energy_window is not None:
         lo, hi = energy_window
-        used &= (E >= lo) & (E <= hi)
-    if not np.any(used):
-        return np.nan, np.nan, np.nan, np.nan, used
-    E_used = E[used]
-    Y_used = Y[used]
-    # Automatic selection by threshold
-    if method == 'auto':
-        try:
-            max_val = np.nanmax(Y_used)
-            threshold = threshold_fraction * max_val
-            mask_thr = Y_used >= threshold
-            if np.sum(mask_thr) < min_points:
-                # fallback: top half of points by Y magnitude
-                order = np.argsort(Y_used)[::-1]
-                take = max(min_points, len(Y_used) // 2)
-                idx = order[:take]
-                sel = np.zeros_like(Y_used, dtype=bool)
-                sel[idx] = True
-            else:
-                sel = mask_thr
-        except Exception:
-            sel = np.ones_like(Y_used, dtype=bool)
+        valid &= (E >= lo) & (E <= hi)
+    if not np.any(valid):
+        return np.nan, np.nan, np.nan, np.nan, valid
+
+    E_valid = E[valid]
+    Y_valid = Y[valid]
+
+    # If manual mode, we'll just use the valid points (caller controlled window)
+    if method != 'auto':
+        sel_mask = np.ones_like(Y_valid, dtype=bool)
     else:
-        # manual: use all points in E_used (caller applies window)
-        sel = np.ones_like(Y_used, dtype=bool)
-    if np.sum(sel) < min_points:
-        return np.nan, np.nan, np.nan, np.nan, used
-    x = E_used[sel]
-    y = Y_used[sel]
+        # Automatic sophisticated selection:
+        # 1) Smooth the curve (Savitzky-Golay) to reduce noise
+        try:
+            window = 11 if len(Y_valid) >= 11 else (len(Y_valid) // 2) * 2 + 1
+            if window < 5:
+                window = 5
+            Y_smooth = savgol_filter(Y_valid, window_length=window, polyorder=2)
+        except Exception:
+            Y_smooth = Y_valid.copy()
+
+        # 2) Compute derivative and find regions where curve is rising
+        try:
+            dYdE = np.gradient(Y_smooth, E_valid)
+        except Exception:
+            dYdE = np.gradient(Y_smooth)
+
+        # Candidate rising region: derivative above small fraction of its max
+        max_der = np.nanmax(dYdE) if np.any(np.isfinite(dYdE)) else 0.0
+        der_thresh = 0.2 * max_der if max_der > 0 else 0.0
+        rising = dYdE >= der_thresh
+
+        # Find contiguous rising segments
+        segs = []
+        start = None
+        for i, v in enumerate(rising):
+            if v and start is None:
+                start = i
+            elif not v and start is not None:
+                segs.append((start, i - 1))
+                start = None
+        if start is not None:
+            segs.append((start, len(rising) - 1))
+
+        # If no rising segments found, fallback to top fraction by Y magnitude
+        candidate_idx = np.arange(len(Y_valid))
+        if segs:
+            # Expand segments slightly to include neighbouring points
+            expanded = []
+            for a, b in segs:
+                la = max(0, a - 2)
+                rb = min(len(Y_valid) - 1, b + 2)
+                expanded.append((la, rb))
+            # Evaluate each expanded segment: sliding-window searching for best R2
+            best_score = -np.inf
+            best_sel = None
+            for a, b in expanded:
+                seg_len = b - a + 1
+                if seg_len < min_points:
+                    continue
+                # For each possible subwindow within segment
+                for w in range(min_points, seg_len + 1):
+                    for start_idx in range(a, b - w + 2):
+                        idxs = np.arange(start_idx, start_idx + w)
+                        x = E_valid[idxs]
+                        y = Y_smooth[idxs]
+                        if len(x) < min_points:
+                            continue
+                        # Linear fit and R2
+                        try:
+                            c = np.polyfit(x, y, 1)
+                            y_pred = c[0] * x + c[1]
+                            ss_res = np.sum((y - y_pred) ** 2)
+                            ss_tot = np.sum((y - np.mean(y)) ** 2)
+                            r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else -np.inf
+                        except Exception:
+                            r2 = -np.inf
+                        # Prefer positive slope and high R2
+                        slope_try = c[0] if 'c' in locals() else 0.0
+                        score = (r2 if np.isfinite(r2) else -np.inf) + (0.5 if slope_try > 0 else -0.5)
+                        if score > best_score:
+                            best_score = score
+                            best_sel = idxs
+            if best_sel is not None:
+                sel_mask = np.zeros_like(Y_valid, dtype=bool)
+                sel_mask[best_sel] = True
+            else:
+                # fallback
+                order = np.argsort(Y_valid)[::-1]
+                take = max(min_points, len(Y_valid) // 2)
+                sel_mask = np.zeros_like(Y_valid, dtype=bool)
+                sel_mask[order[:take]] = True
+        else:
+            order = np.argsort(Y_valid)[::-1]
+            take = max(min_points, len(Y_valid) // 2)
+            sel_mask = np.zeros_like(Y_valid, dtype=bool)
+            sel_mask[order[:take]] = True
+
+    # Now perform final fit on selected points
+    if method == 'auto':
+        x = E_valid[sel_mask]
+        y = Y_valid[sel_mask]
+    else:
+        x = E_valid
+        y = Y_valid
+
+    if len(x) < min_points:
+        used_mask = np.zeros_like(valid, dtype=bool)
+        # map back any selection if present
+        if 'sel_mask' in locals():
+            used_indices = np.where(valid)[0]
+            used_mask[used_indices[sel_mask]] = True
+        return np.nan, np.nan, np.nan, np.nan, used_mask
+
+    # Optionally apply one pass of sigma-clipping to remove outliers before final fit
     try:
         coeffs = np.polyfit(x, y, 1)
         slope, intercept = float(coeffs[0]), float(coeffs[1])
         y_pred = slope * x + intercept
-        ss_res = np.sum((y - y_pred) ** 2)
-        ss_tot = np.sum((y - np.mean(y)) ** 2)
-        r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else np.nan
-        Eg = -intercept / slope if slope != 0 and slope > 0 else np.nan
+        resid = y - y_pred
+        std = np.nanstd(resid)
+        if std > 0:
+            keep = np.abs(resid) <= (2.5 * std)
+            if np.sum(keep) >= min_points and np.sum(keep) < len(x):
+                x2 = x[keep]
+                y2 = y[keep]
+                coeffs = np.polyfit(x2, y2, 1)
+                slope, intercept = float(coeffs[0]), float(coeffs[1])
+                y_pred = slope * x2 + intercept
+                ss_res = np.sum((y2 - y_pred) ** 2)
+                ss_tot = np.sum((y2 - np.mean(y2)) ** 2)
+                r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else np.nan
+            else:
+                ss_res = np.sum((y - y_pred) ** 2)
+                ss_tot = np.sum((y - np.mean(y)) ** 2)
+                r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else np.nan
+        else:
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else np.nan
     except Exception:
-        slope, intercept, Eg, r2 = np.nan, np.nan, np.nan, np.nan
-    # Build final used mask in the original E array
-    used_mask = np.zeros_like(used, dtype=bool)
-    # Map sel indices back to used positions
-    used_indices = np.where(used)[0]
-    selected_indices = used_indices[np.where(sel)[0]]
-    used_mask[selected_indices] = True
+        slope, intercept, r2 = np.nan, np.nan, np.nan
+
+    Eg = -intercept / slope if np.isfinite(slope) and slope > 0 else np.nan
+
+    # Build used_mask mapped to original E array
+    used_mask = np.zeros_like(valid, dtype=bool)
+    if method == 'auto' and 'sel_mask' in locals():
+        used_indices = np.where(valid)[0]
+        used_mask[used_indices[sel_mask]] = True
+    else:
+        used_mask[valid] = True
+
     return slope, intercept, Eg, r2, used_mask
 
 
