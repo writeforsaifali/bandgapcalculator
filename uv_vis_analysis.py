@@ -1952,23 +1952,55 @@ def main() -> None:
                 """
             )
             selected_for_tauc: List[str] = []
-            wl_col = ('global', 'Wavelength (nm)')
-            wavelengths = merged_data[wl_col].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
+            # Locate wavelength column robustly. merged_data may be the flat
+            # DataFrame produced by process_data (string column 'Wavelength (nm)')
+            # or a MultiIndex DataFrame with ('global','Wavelength (nm)').
+            wavelengths = None
+            if 'Wavelength (nm)' in merged_data.columns:
+                try:
+                    wavelengths = merged_data['Wavelength (nm)'].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
+                except Exception:
+                    wavelengths = merged_data['Wavelength (nm)'].iloc[:int(limit_rows)].reset_index(drop=True).astype(float)
+            else:
+                wl_candidates = [c for c in merged_data.columns if isinstance(c, tuple) and c[1] == 'Wavelength (nm)']
+                if wl_candidates:
+                    try:
+                        wavelengths = merged_data[wl_candidates[0]].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
+                    except Exception:
+                        wavelengths = merged_data[wl_candidates[0]].iloc[:int(limit_rows)].reset_index(drop=True)
+            # Final fallback: first column cast to float
+            if wavelengths is None:
+                wavelengths = pd.to_numeric(merged_data.iloc[:, 0].iloc[:int(limit_rows)].reset_index(drop=True), errors='coerce')
+
             for s in selected_samples:
-                # Discover available measurement columns for this sample
-                meas_cols = [col for col in merged_data.columns if col[0] == s]
-                meas_names = [c[1] for c in meas_cols]
+                # Discover available measurement columns for this sample.
+                # Support both MultiIndex columns (sample, meas) and flat columns like 'Sample %T'.
+                if any(isinstance(c, tuple) for c in merged_data.columns):
+                    meas_cols = [c for c in merged_data.columns if isinstance(c, tuple) and c[0] == s and c[1]]
+                    meas_names = [c[1] for c in meas_cols]
+                    is_multi = True
+                else:
+                    prefix = f'{s} '
+                    meas_cols = [c for c in merged_data.columns if isinstance(c, str) and c.startswith(prefix)]
+                    # Derive measurement names by stripping the sample prefix
+                    meas_names = [c[len(prefix):] for c in meas_cols]
+                    is_multi = False
                 if not meas_names:
                     continue
                 with st.expander(f'{s} — data / choose measurement', expanded=False):
                     chosen = st.selectbox(f'Choose measurement column for {s}', options=meas_names, index=0, key=f'meas_{s}')
-                    chosen_col = (s, chosen)
                     thickness_nm = st.number_input(f'Thickness for {s} (nm, 0 = unknown)', min_value=0.0, value=0.0, step=1.0, key=f'thick_{s}')
                     use_sample = st.checkbox(f'Select {s} for further analysis', value=False, key=f'use_{s}')
                     if use_sample:
                         selected_for_tauc.append(s)
+                    # Retrieve measurement series robustly depending on column layout
                     try:
-                        meas_series = merged_data[chosen_col].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
+                        if is_multi:
+                            chosen_col = (s, chosen)
+                            meas_series = merged_data[chosen_col].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
+                        else:
+                            chosen_col_str = f'{s} {chosen}'
+                            meas_series = merged_data[chosen_col_str].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
                     except Exception:
                         meas_series = pd.Series([np.nan] * len(wavelengths))
                     name_lower = str(chosen).lower()
