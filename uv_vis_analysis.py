@@ -1458,101 +1458,107 @@ def fit_tauc_line(
     E_valid = E[valid]
     Y_valid = Y[valid]
 
-    # If manual mode, we'll just use the valid points (caller controlled window)
+    # Manual mode: use the provided energy window / valid points
     if method != 'auto':
         sel_mask = np.ones_like(Y_valid, dtype=bool)
     else:
-        # Automatic sophisticated selection:
-        # 1) Smooth the curve (Savitzky-Golay) to reduce noise
+        # Automatic selection pipeline
+        n = len(Y_valid)
+        # Choose a Savitzky-Golay window: odd, <= n, and reasonably sized
         try:
-            window = 11 if len(Y_valid) >= 11 else (len(Y_valid) // 2) * 2 + 1
-            if window < 5:
-                window = 5
-            Y_smooth = savgol_filter(Y_valid, window_length=window, polyorder=2)
+            target_win = 51
+            if target_win > n:
+                target_win = n if n % 2 == 1 else n - 1
+            if target_win < 3:
+                target_win = 3
+            # Ensure odd
+            if target_win % 2 == 0:
+                target_win -= 1
+            polyord = 3 if target_win > 3 else 2
+            Y_smooth = savgol_filter(Y_valid, window_length=target_win, polyorder=min(polyord, target_win - 1))
         except Exception:
             Y_smooth = Y_valid.copy()
 
-        # 2) Compute derivative and find regions where curve is rising
+        # Compute derivative dY/dE and also relative level
         try:
             dYdE = np.gradient(Y_smooth, E_valid)
         except Exception:
             dYdE = np.gradient(Y_smooth)
 
-        # Candidate rising region: derivative above small fraction of its max
+        # Use both derivative and amplitude thresholds to find candidate rising regions
         max_der = np.nanmax(dYdE) if np.any(np.isfinite(dYdE)) else 0.0
-        der_thresh = 0.2 * max_der if max_der > 0 else 0.0
-        rising = dYdE >= der_thresh
+        der_thresh = max(1e-8, 0.15 * max_der) if max_der > 0 else 0.0
+        max_y = np.nanmax(Y_smooth) if np.any(np.isfinite(Y_smooth)) else 0.0
+        y_thresh = max(1e-12, 0.02 * max_y)
 
-        # Find contiguous rising segments
+        rising = (dYdE >= der_thresh) & (Y_smooth >= y_thresh)
+
+        # Find contiguous True segments
         segs = []
         start = None
         for i, v in enumerate(rising):
             if v and start is None:
                 start = i
-            elif not v and start is not None:
+            elif (not v) and start is not None:
                 segs.append((start, i - 1))
                 start = None
         if start is not None:
             segs.append((start, len(rising) - 1))
 
-        # If no rising segments found, fallback to top fraction by Y magnitude
-        candidate_idx = np.arange(len(Y_valid))
-        if segs:
-            # Expand segments slightly to include neighbouring points
-            expanded = []
-            for a, b in segs:
-                la = max(0, a - 2)
-                rb = min(len(Y_valid) - 1, b + 2)
-                expanded.append((la, rb))
-            # Evaluate each expanded segment: sliding-window searching for best R2
+        # If no segments, broaden to region where Y is above a fraction of max
+        if not segs:
+            order = np.argsort(Y_smooth)[::-1]
+            take = max(min_points, int(max(2, n // 4)))
+            sel_mask = np.zeros_like(Y_valid, dtype=bool)
+            sel_mask[order[:take]] = True
+        else:
+            # Evaluate candidate subwindows inside each segment and pick best by R2 (prefer positive slope)
             best_score = -np.inf
             best_sel = None
-            for a, b in expanded:
-                seg_len = b - a + 1
+            for a, b in segs:
+                # expand a bit to include boundary points
+                a0 = max(0, a - 2)
+                b0 = min(n - 1, b + 2)
+                seg_len = b0 - a0 + 1
                 if seg_len < min_points:
                     continue
-                # For each possible subwindow within segment
+                # slide windows from size min_points up to full segment
                 for w in range(min_points, seg_len + 1):
-                    for start_idx in range(a, b - w + 2):
-                        idxs = np.arange(start_idx, start_idx + w)
+                    for s_idx in range(a0, b0 - w + 2):
+                        idxs = np.arange(s_idx, s_idx + w)
                         x = E_valid[idxs]
                         y = Y_smooth[idxs]
                         if len(x) < min_points:
                             continue
-                        # Linear fit and R2
+                        # Fit on smoothed data for stability
                         try:
                             c = np.polyfit(x, y, 1)
-                            y_pred = c[0] * x + c[1]
-                            ss_res = np.sum((y - y_pred) ** 2)
-                            ss_tot = np.sum((y - np.mean(y)) ** 2)
-                            r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else -np.inf
                         except Exception:
-                            r2 = -np.inf
-                        # Prefer positive slope and high R2
-                        slope_try = c[0] if 'c' in locals() else 0.0
-                        score = (r2 if np.isfinite(r2) else -np.inf) + (0.5 if slope_try > 0 else -0.5)
+                            continue
+                        y_pred = c[0] * x + c[1]
+                        ss_res = np.sum((y - y_pred) ** 2)
+                        ss_tot = np.sum((y - np.mean(y)) ** 2)
+                        r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else -np.inf
+                        slope_try = float(c[0])
+                        # score prefers high R2 and positive slope and wider windows
+                        score = (r2 if np.isfinite(r2) else -np.inf) + (0.5 if slope_try > 0 else -0.5) + 0.01 * len(x)
                         if score > best_score:
                             best_score = score
-                            best_sel = idxs
+                            best_sel = idxs.copy()
             if best_sel is not None:
                 sel_mask = np.zeros_like(Y_valid, dtype=bool)
                 sel_mask[best_sel] = True
             else:
-                # fallback
-                order = np.argsort(Y_valid)[::-1]
-                take = max(min_points, len(Y_valid) // 2)
+                # Fallback to top values
+                order = np.argsort(Y_smooth)[::-1]
+                take = max(min_points, int(max(2, n // 4)))
                 sel_mask = np.zeros_like(Y_valid, dtype=bool)
                 sel_mask[order[:take]] = True
-        else:
-            order = np.argsort(Y_valid)[::-1]
-            take = max(min_points, len(Y_valid) // 2)
-            sel_mask = np.zeros_like(Y_valid, dtype=bool)
-            sel_mask[order[:take]] = True
 
-    # Now perform final fit on selected points
+    # Now perform final fit on selected points (use smoothed values for stability)
     if method == 'auto':
         x = E_valid[sel_mask]
-        y = Y_valid[sel_mask]
+        y = Y_smooth[sel_mask] if 'Y_smooth' in locals() else Y_valid[sel_mask]
     else:
         x = E_valid
         y = Y_valid
@@ -1565,14 +1571,15 @@ def fit_tauc_line(
             used_mask[used_indices[sel_mask]] = True
         return np.nan, np.nan, np.nan, np.nan, used_mask
 
-    # Optionally apply one pass of sigma-clipping to remove outliers before final fit
+
+    # Final fit with optional one-pass sigma-clipping
     try:
         coeffs = np.polyfit(x, y, 1)
         slope, intercept = float(coeffs[0]), float(coeffs[1])
         y_pred = slope * x + intercept
         resid = y - y_pred
         std = np.nanstd(resid)
-        if std > 0:
+        if std > 0 and len(x) > min_points + 1:
             keep = np.abs(resid) <= (2.5 * std)
             if np.sum(keep) >= min_points and np.sum(keep) < len(x):
                 x2 = x[keep]
