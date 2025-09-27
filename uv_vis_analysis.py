@@ -2017,11 +2017,13 @@ def main() -> None:
                 file_name='bandgaps.csv',
                 mime='text/csv',
             )
-            # Show detailed intermediate data for each sample
+            # Show detailed intermediate data for each sample. Each sample gets
+            # its own collapsed expander (closed by default) the user can open
+            # to inspect the per-sample values used for Tauc fitting.
             if tauc_data:
-                with st.expander('Detailed Tauc data by sample', expanded=False):
-                    for samp, df in tauc_data.items():
-                        st.markdown(f'**{samp}**')
+                st.markdown('**Detailed Tauc data by sample**')
+                for samp, df in tauc_data.items():
+                    with st.expander(f'{samp} (click to expand)', expanded=False):
                         # Reorder columns to prioritise wavelength, transmittance, absorbance, alpha, energy and Tauc
                         ordered_cols: List[str] = []
                         preferred_order = [
@@ -2032,6 +2034,8 @@ def main() -> None:
                             'Absorption coefficient (1/m)',
                             'Energy (eV)',
                             '(αE)^n',
+                            'Tauc_raw',
+                            'Tauc',
                         ]
                         for col in preferred_order:
                             if col in df.columns:
@@ -2042,55 +2046,85 @@ def main() -> None:
                                 ordered_cols.append(col)
                         st.dataframe(df[ordered_cols])
             st.markdown('---')
-            # Plot Tauc curves for each processed sample
+            # Plot Tauc curves for each processed sample. Provide an option
+            # to overlay all samples into a single plot or show separate
+            # plots per sample. Overlay is often useful to compare curves.
             st.subheader('Tauc plots')
             # If no samples processed, show information
             if bandgap_df.empty:
                 st.info('No valid samples could be processed for band gap analysis.')
             else:
+                plot_mode = st.radio('Plot display mode', options=['Overlay all samples', 'Separate per sample'], index=0)
                 cmap = plt.get_cmap(cmap_name)
-                num_rows = len(bandgap_df)
-                for plot_idx, row in bandgap_df.iterrows():
-                    sample_name = row['Sample']
-                    Eg_val = row['Eg (eV)']
-                    if sample_name not in tauc_curves:
-                        st.warning(
-                            f'No valid data for sample {sample_name}; cannot compute Tauc plot.'
-                        )
-                        continue
-                    tauc_df_plot = tauc_curves[sample_name]
-                    # Choose colour for this sample based on index
-                    if num_rows > 1:
-                        color = cmap(plot_idx / max(num_rows - 1, 1))
-                    else:
-                        color = cmap(0)
-                    slope, intercept = fit_params.get(sample_name, (np.nan, np.nan))
-                    fig = plot_tauc_curve(
-                        tauc_df_plot,
-                        sample_name,
-                        (slope, intercept),
-                        Eg_val,
-                        color,
-                        line_style,
-                        line_width,
-                        marker,
-                        legend_loc,
-                        show_grid,
-                        (fig_width, fig_height),
-                        int(dpi),
-                    )
+                sample_list = list(bandgap_df['Sample'])
+                num_samples = len(sample_list)
+                if plot_mode == 'Overlay all samples':
+                    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=int(dpi))
+                    for idx, sample_name in enumerate(sample_list):
+                        if sample_name not in tauc_curves:
+                            st.warning(f'No valid data for sample {sample_name}; skipping.')
+                            continue
+                        tauc_df_plot = tauc_curves[sample_name].sort_values('E (eV)')
+                        x = tauc_df_plot['E (eV)'].values
+                        y = tauc_df_plot['Tauc'].values
+                        color = cmap(idx / max(num_samples - 1, 1)) if num_samples > 1 else cmap(0)
+                        mk = None if (marker is None or str(marker).lower() == 'none') else marker
+                        ax.plot(x, y, label=sample_name, color=color, linestyle=line_style, linewidth=line_width, marker=mk)
+                        # Plot fitted line if available
+                        slope, intercept = fit_params.get(sample_name, (np.nan, np.nan))
+                        if np.isfinite(slope) and np.isfinite(intercept) and slope > 0:
+                            # Use x range for fit line
+                            x_fit = np.linspace(np.nanmin(x), np.nanmax(x), 200)
+                            y_fit = slope * x_fit + intercept
+                            ax.plot(x_fit, y_fit, color=color, linestyle='--', linewidth=1.2, alpha=0.8)
+                            # Annotate Eg
+                            Eg_val = bandgap_df.loc[bandgap_df['Sample'] == sample_name, 'Eg (eV)'].values
+                            if Eg_val.size and np.isfinite(Eg_val[0]):
+                                Eg = float(Eg_val[0])
+                                ax.axvline(Eg, color=color, linestyle=':', linewidth=1.0, alpha=0.8)
+                                # place text near top
+                                y_text = 0.95 * np.nanmax(y) if np.isfinite(np.nanmax(y)) else 0
+                                ax.text(Eg, y_text, f'{Eg:.3f} eV', color=color, rotation=90, va='top', ha='center', bbox=dict(facecolor='white', alpha=0.6, lw=0))
+                    ax.set_xlabel('Photon energy E (eV)')
+                    ax.set_ylabel(r'$(F(R) \times E)^{n}$')
+                    ax.set_title('Tauc plots (overlay)')
+                    if show_grid:
+                        ax.grid(True, which='both', linestyle='--', alpha=0.3)
+                    ax.legend(loc=legend_loc)
                     st.pyplot(fig)
-                    # Download high‑resolution Tauc plot
+                    # Download overlay figure
                     buf = io.BytesIO()
-                    # Use high dpi for download (300)
-                    fig.savefig(buf, format='png', dpi=300)
+                    fig.savefig(buf, format='png', dpi=int(dpi))
                     buf.seek(0)
-                    st.download_button(
-                        label=f'Download Tauc plot for {sample_name}',
-                        data=buf.getvalue(),
-                        file_name=f'tauc_{sample_name.replace(" ", "_").lower()}.png',
-                        mime='image/png',
-                    )
+                    st.download_button(label='Download overlay Tauc plot (PNG)', data=buf.getvalue(), file_name='tauc_overlay.png', mime='image/png')
+                else:
+                    # Separate per-sample plots (one figure per sample)
+                    for idx, sample_name in enumerate(sample_list):
+                        if sample_name not in tauc_curves:
+                            st.warning(f'No valid data for sample {sample_name}; cannot compute Tauc plot.')
+                            continue
+                        tauc_df_plot = tauc_curves[sample_name]
+                        slope, intercept = fit_params.get(sample_name, (np.nan, np.nan))
+                        color = cmap(idx / max(num_samples - 1, 1)) if num_samples > 1 else cmap(0)
+                        fig = plot_tauc_curve(
+                            tauc_df_plot.sort_values('E (eV)'),
+                            sample_name,
+                            (slope, intercept),
+                            float(bandgap_df.loc[bandgap_df['Sample'] == sample_name, 'Eg (eV)'].values[0]) if not bandgap_df.empty else np.nan,
+                            color,
+                            line_style,
+                            line_width,
+                            marker,
+                            legend_loc,
+                            show_grid,
+                            (fig_width, fig_height),
+                            int(dpi),
+                        )
+                        st.pyplot(fig)
+                        buf = io.BytesIO()
+                        fig.savefig(buf, format='png', dpi=300)
+                        buf.seek(0)
+                        st.download_button(label=f'Download Tauc plot for {sample_name}', data=buf.getvalue(), file_name=f'tauc_{sample_name.replace(" ","_").lower()}.png', mime='image/png')
 
 
 if __name__ == '__main__':
