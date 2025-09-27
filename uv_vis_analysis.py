@@ -791,6 +791,8 @@ def compute_tauc_bandgap(
     smooth_polyorder: int = 2,
     threshold_fraction: float = 0.1,
     thicknesses: Optional[Dict[str, float]] = None,
+    enable_fallback: bool = True,
+    show_diagnostics: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, Tuple[float, float]], Dict[str, pd.DataFrame]]:
     """
     Compute band gaps for multiple samples using a flexible Tauc plot approach.
@@ -1034,38 +1036,81 @@ def compute_tauc_bandgap(
             bandgap_records.append({'Sample': sample, 'Eg (eV)': np.nan})
             fit_params[sample] = (np.nan, np.nan)
             continue
-        # Determine threshold based on smoothed Tauc values
+        # Determine threshold based on smoothed Tauc values and attempt fitting.
         max_val = df_range['Tauc_smooth'].max()
         if not np.isfinite(max_val) or max_val <= 0:
             bandgap_records.append({'Sample': sample, 'Eg (eV)': np.nan})
             fit_params[sample] = (np.nan, np.nan)
             continue
-        threshold = threshold_fraction * max_val
-        mask_threshold = df_range['Tauc_smooth'] >= threshold
-        df_fit = df_range.loc[mask_threshold]
-        # Fallback: if too few points, take top half of the energy‑range data
-        if df_fit.shape[0] < 2:
-            df_fit = df_range.sort_values('Tauc_smooth', ascending=False).iloc[: max(2, df_range.shape[0] // 2)]
-        # Attempt to fit a straight line
+
+        # We'll attempt multiple threshold fractions as fallbacks when the
+        # initial fit fails or yields a non-positive slope.
+        tried_thresholds = []
+        slopes = np.array([])
+        intercepts = np.array([])
+        Eg = np.nan
+        slope = np.nan
+        intercept = np.nan
+        # Create a list of candidate thresholds (start with provided one)
+        candidate_thresholds = [threshold_fraction, threshold_fraction / 2.0, threshold_fraction / 4.0, 0.01, 0.0]
+        for thr in candidate_thresholds:
+            if thr in tried_thresholds:
+                continue
+            tried_thresholds.append(thr)
+            threshold = thr * max_val
+            mask_threshold = df_range['Tauc_smooth'] >= threshold
+            df_fit = df_range.loc[mask_threshold]
+            # Fallback: if too few points, take top half of the energy‑range data
+            if df_fit.shape[0] < 2:
+                df_fit = df_range.sort_values('Tauc_smooth', ascending=False).iloc[: max(2, df_range.shape[0] // 2)]
+            try:
+                x_vals = df_fit['E (eV)'].values
+                y_vals = df_fit['Tauc_smooth'].values
+                coeffs = np.polyfit(x_vals, y_vals, 1)
+                slope_try, intercept_try = coeffs[0], coeffs[1]
+                slopes = np.append(slopes, slope_try)
+                intercepts = np.append(intercepts, intercept_try)
+                # Accept this fit if slope is positive
+                if np.isfinite(slope_try) and slope_try > 0:
+                    slope = slope_try
+                    intercept = intercept_try
+                    Eg = -intercept / slope if slope != 0 else np.nan
+                    used_threshold = thr
+                    used_df_fit = df_fit
+                    break
+                else:
+                    # continue trying other thresholds
+                    used_df_fit = df_fit
+                    used_threshold = thr
+            except Exception:
+                used_df_fit = df_fit
+                used_threshold = thr
+                continue
+        # If no positive-slope fit was found but we have any fit values, pick
+        # the one with the largest positive slope (if any) else leave NaN.
+        if not np.isfinite(slope) and slopes.size > 0:
+            pos_idx = np.where(slopes > 0)[0]
+            if pos_idx.size > 0:
+                idx = pos_idx[np.argmax(slopes[pos_idx])]
+                slope = slopes[idx]
+                intercept = intercepts[idx]
+                Eg = -intercept / slope if slope != 0 else np.nan
+                # used_df_fit remains last tried; that's acceptable for diagnostics
+        # Store diagnostics into detailed_df by marking which rows were used
         try:
-            x_vals = df_fit['E (eV)'].values
-            y_vals = df_fit['Tauc_smooth'].values
-            coeffs = np.polyfit(x_vals, y_vals, 1)
-            slope, intercept = coeffs[0], coeffs[1]
-            if slope > 0:
-                Eg = -intercept / slope
-            else:
-                Eg = np.nan
+            detailed_df['Fit used'] = detailed_df['Energy (eV)'].isin(used_df_fit['E (eV)'])
+            detailed_df['Fit threshold used'] = float(used_threshold)
         except Exception:
-            slope, intercept = np.nan, np.nan
-            Eg = np.nan
-        bandgap_records.append({'Sample': sample, 'Eg (eV)': Eg})
-        fit_params[sample] = (slope, intercept)
-        # Prepare smoothed Tauc curve for plotting
-        tauc_plot_df = df_range[['E (eV)', 'Tauc_smooth']].rename(columns={'Tauc_smooth': 'Tauc'})
-        tauc_curves[sample] = tauc_plot_df
-        # Store detailed data
-        detailed_data[sample] = detailed_df
+            # If anything fails, create default columns
+            detailed_df['Fit used'] = False
+            detailed_df['Fit threshold used'] = float(threshold_fraction)
+    bandgap_records.append({'Sample': sample, 'Eg (eV)': Eg})
+    fit_params[sample] = (slope, intercept)
+    # Prepare smoothed Tauc curve for plotting
+    tauc_plot_df = df_range[['E (eV)', 'Tauc_smooth']].rename(columns={'Tauc_smooth': 'Tauc'})
+    tauc_curves[sample] = tauc_plot_df
+    # Store detailed data
+    detailed_data[sample] = detailed_df
     bandgap_df = pd.DataFrame(bandgap_records)
     return bandgap_df, tauc_curves, fit_params, detailed_data
 
@@ -1081,6 +1126,8 @@ def compute_tauc_alpha_bandgap(
     smooth_window: int = 21,
     smooth_polyorder: int = 2,
     threshold_fraction: float = 0.1,
+    enable_fallback: bool = True,
+    show_diagnostics: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], Dict[str, Tuple[float, float]], Dict[str, pd.DataFrame]]:
     """
     Compute band gaps for multiple samples using the absorption‑based Tauc plot.
@@ -1667,6 +1714,17 @@ def main() -> None:
             value=False,
             help='Compute band gaps using a Tauc plot for the selected samples.',
         )
+        # Diagnostics and fallback behaviour
+        enable_fallback_fit = st.checkbox(
+            'Enable fallback fitting (try multiple thresholds)',
+            value=True,
+            help='If the initial fit fails or produces non-positive slope, try looser thresholds as fallback.',
+        )
+        show_diagnostics = st.checkbox(
+            'Show diagnostic info for Tauc fits',
+            value=False,
+            help='When enabled, per-sample fit diagnostics (slope/intercept/used threshold) are shown in the per-sample expanders.',
+        )
         st.markdown('---')
         # Plot customisation options
         st.subheader('Plot Customisation')
@@ -1878,253 +1936,80 @@ def main() -> None:
             display_and_download(fig, 'Second_Derivative')
 
         # ------------------------------------------------------------------
-        # Band gap analysis (Tauc plot)
-        # Integrate the Tauc option into the main area based on sidebar selection.
+        # Band gap data preview (tables, no plotting)
+        # For each selected sample show a table with wavelength, the chosen
+        # measurement column (e.g. %T or %R), computed alpha (or F(R)) and
+        # photon energy E (eV). User can choose the measurement column and
+        # optionally provide thickness (nm) used for alpha calculation.
         if show_tauc:
-            st.subheader('Band gap analysis (Tauc plot)')
-            # Method selection: absorption‑based or reflectance‑based
-            tauc_method = st.radio(
-                'Tauc plot method',
-                options=[
-                    'Absorption‑based (αhν)^n vs hν',
-                    'Reflectance‑based (Kubelka–Munk)',
-                ],
-                index=0,
-                help=(
-                    'Choose whether to compute the Tauc plot using the absorption coefficient '
-                    'from transmittance or the Kubelka–Munk function from reflectance.'
-                ),
+            st.subheader('Band gap data preview (no plotting)')
+            st.markdown(
+                """
+                For each sample/variation below choose the measurement column to use.
+                If transmittance is chosen you may optionally provide a thickness (nm)
+                to compute an absorption coefficient alpha = -ln(T)/d (1/m).
+                If thickness is left as 0 the table will show -ln(T) (unitless).
+                """
             )
-            # Per‑sample thickness inputs.  Thickness may vary by sample, so
-            # request a numeric input for each selected sample.  These
-            # thickness values will be used when computing the absorption
-            # coefficient for the absorption‑based method.  A value of 0
-            # (default) means the sample will be skipped if it lacks
-            # reflectance data.
-            st.markdown('**Film thickness for each sample**')
-            sample_thicknesses: Dict[str, float] = {}
+            selected_for_tauc: List[str] = []
+            wl_col = ('global', 'Wavelength (nm)')
+            wavelengths = merged_data[wl_col].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
             for s in selected_samples:
-                sample_thicknesses[s] = st.number_input(
-                    f'Thickness for {s} (nm)',
-                    min_value=0.0,
-                    max_value=1e6,
-                    value=500.0,
-                    step=1.0,
-                )
-            # Glass sample selection for transmittance correction
-            glass_sample = None
-            if tauc_method.startswith('Absorption'):
-                # Provide a list of all available samples as potential glass
-                glass_options = ['None'] + sample_candidates
-                selected_glass = st.selectbox(
-                    'Substrate/glass sample for correction',
-                    options=glass_options,
-                    index=0,
-                    help=(
-                        'If a reference glass/substrate measurement is provided among the samples, '
-                        'select it here to correct sample transmittance. The selected glass sample '
-                        'will not be analysed.'
-                    ),
-                )
-                if selected_glass != 'None':
-                    glass_sample = selected_glass
-            st.markdown('**Transition type**')
-            # Ask user to specify direct or indirect band gap using checkboxes.
-            # Direct corresponds to n=2 and indirect corresponds to n=0.5.  If both or neither
-            # are selected, direct is chosen by default.
-            col_direct, col_indirect = st.columns(2)
-            direct_checked = col_direct.checkbox('Direct band gap (n=2)', value=True)
-            indirect_checked = col_indirect.checkbox('Indirect band gap (n=0.5)', value=False)
-            # Determine Tauc exponent based on selections
-            if direct_checked and not indirect_checked:
-                tauc_exponent = 2.0
-            elif indirect_checked and not direct_checked:
-                tauc_exponent = 0.5
-            else:
-                # If both or none selected, default to direct
-                if direct_checked and indirect_checked:
-                    st.warning('Both transition types selected; defaulting to direct transition (n=2).')
-                tauc_exponent = 2.0
-            # Remove explicit photon energy bounds.  The full energy range
-            # inferred from the wavelength values will be used for
-            # fitting.  The user no longer specifies minimum and
-            # maximum photon energy.
-            e_min: Optional[float] = None
-            e_max: Optional[float] = None
-            # Smoothing parameters for Tauc curves
-            tauc_smooth_window = st.number_input(
-                'Smoothing window length (odd integer)',
-                min_value=3,
-                max_value=101,
-                value=21,
-                step=2,
-            )
-            tauc_smooth_polyorder = st.number_input(
-                'Smoothing polynomial order',
-                min_value=1,
-                max_value=5,
-                value=2,
-                step=1,
-            )
-            threshold_fraction = st.slider(
-                'Threshold fraction for linear fit region',
-                min_value=0.0,
-                max_value=1.0,
-                value=0.1,
-                step=0.01,
-                help='Fraction of maximum Tauc value used to select points for linear fitting.',
-            )
-            # Perform band gap analysis without specifying explicit photon energy range
-            with st.spinner('Computing band gaps…'):
-                if tauc_method.startswith('Absorption'):
-                    # Exclude glass sample from analysis
-                    samples_for_tauc = [s for s in selected_samples if s != glass_sample]
-                    bandgap_df, tauc_curves, fit_params, tauc_data = compute_tauc_alpha_bandgap(
-                        merged_data,
-                        samples=samples_for_tauc,
-                        limit_rows=int(limit_rows),
-                        exponent=float(tauc_exponent),
-                        thicknesses=sample_thicknesses,
-                        glass_sample=glass_sample,
-                        energy_range=None,
-                        smooth_window=int(tauc_smooth_window),
-                        smooth_polyorder=int(tauc_smooth_polyorder),
-                        threshold_fraction=float(threshold_fraction),
-                    )
-                else:
-                    # Reflectance‑based method uses existing function
-                    bandgap_df, tauc_curves, fit_params, tauc_data = compute_tauc_bandgap(
-                        merged_data,
-                        samples=selected_samples,
-                        limit_rows=int(limit_rows),
-                        tauc_exponent=float(tauc_exponent),
-                        energy_range=None,
-                        smooth_window=int(tauc_smooth_window),
-                        smooth_polyorder=int(tauc_smooth_polyorder),
-                        threshold_fraction=float(threshold_fraction),
-                        thicknesses=sample_thicknesses,
-                    )
-            # Display band gap table
-            # Display band gap results
-            st.subheader('Extracted band gaps')
-            st.dataframe(bandgap_df)
-            # Provide download for band gap values
-            bg_buffer = io.StringIO()
-            bandgap_df.to_csv(bg_buffer, index=False)
-            st.download_button(
-                label='Download band gap values as CSV',
-                data=bg_buffer.getvalue(),
-                file_name='bandgaps.csv',
-                mime='text/csv',
-            )
-            # Show detailed intermediate data for each sample. Each sample gets
-            # its own collapsed expander (closed by default) the user can open
-            # to inspect the per-sample values used for Tauc fitting.
-            if tauc_data:
-                st.markdown('**Detailed Tauc data by sample**')
-                for samp, df in tauc_data.items():
-                    with st.expander(f'{samp} (click to expand)', expanded=False):
-                        # Reorder columns to prioritise wavelength, transmittance, absorbance, alpha, energy and Tauc
-                        ordered_cols: List[str] = []
-                        preferred_order = [
-                            'Wavelength (nm)',
-                            'Transmittance (fraction)',
-                            'Transmittance (%)',
-                            'Absorbance (base-10)',
-                            'Absorption coefficient (1/m)',
-                            'Energy (eV)',
-                            '(αE)^n',
-                            'Tauc_raw',
-                            'Tauc',
-                        ]
-                        for col in preferred_order:
-                            if col in df.columns:
-                                ordered_cols.append(col)
-                        # Append remaining columns
-                        for col in df.columns:
-                            if col not in ordered_cols:
-                                ordered_cols.append(col)
-                        st.dataframe(df[ordered_cols])
-            st.markdown('---')
-            # Plot Tauc curves for each processed sample. Provide an option
-            # to overlay all samples into a single plot or show separate
-            # plots per sample. Overlay is often useful to compare curves.
-            st.subheader('Tauc plots')
-            # If no samples processed, show information
-            if bandgap_df.empty:
-                st.info('No valid samples could be processed for band gap analysis.')
-            else:
-                plot_mode = st.radio('Plot display mode', options=['Overlay all samples', 'Separate per sample'], index=0)
-                cmap = plt.get_cmap(cmap_name)
-                sample_list = list(bandgap_df['Sample'])
-                num_samples = len(sample_list)
-                if plot_mode == 'Overlay all samples':
-                    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=int(dpi))
-                    for idx, sample_name in enumerate(sample_list):
-                        if sample_name not in tauc_curves:
-                            st.warning(f'No valid data for sample {sample_name}; skipping.')
-                            continue
-                        tauc_df_plot = tauc_curves[sample_name].sort_values('E (eV)')
-                        x = tauc_df_plot['E (eV)'].values
-                        y = tauc_df_plot['Tauc'].values
-                        color = cmap(idx / max(num_samples - 1, 1)) if num_samples > 1 else cmap(0)
-                        mk = None if (marker is None or str(marker).lower() == 'none') else marker
-                        ax.plot(x, y, label=sample_name, color=color, linestyle=line_style, linewidth=line_width, marker=mk)
-                        # Plot fitted line if available
-                        slope, intercept = fit_params.get(sample_name, (np.nan, np.nan))
-                        if np.isfinite(slope) and np.isfinite(intercept) and slope > 0:
-                            # Use x range for fit line
-                            x_fit = np.linspace(np.nanmin(x), np.nanmax(x), 200)
-                            y_fit = slope * x_fit + intercept
-                            ax.plot(x_fit, y_fit, color=color, linestyle='--', linewidth=1.2, alpha=0.8)
-                            # Annotate Eg
-                            Eg_val = bandgap_df.loc[bandgap_df['Sample'] == sample_name, 'Eg (eV)'].values
-                            if Eg_val.size and np.isfinite(Eg_val[0]):
-                                Eg = float(Eg_val[0])
-                                ax.axvline(Eg, color=color, linestyle=':', linewidth=1.0, alpha=0.8)
-                                # place text near top
-                                y_text = 0.95 * np.nanmax(y) if np.isfinite(np.nanmax(y)) else 0
-                                ax.text(Eg, y_text, f'{Eg:.3f} eV', color=color, rotation=90, va='top', ha='center', bbox=dict(facecolor='white', alpha=0.6, lw=0))
-                    ax.set_xlabel('Photon energy E (eV)')
-                    ax.set_ylabel(r'$(F(R) \times E)^{n}$')
-                    ax.set_title('Tauc plots (overlay)')
-                    if show_grid:
-                        ax.grid(True, which='both', linestyle='--', alpha=0.3)
-                    ax.legend(loc=legend_loc)
-                    st.pyplot(fig)
-                    # Download overlay figure
-                    buf = io.BytesIO()
-                    fig.savefig(buf, format='png', dpi=int(dpi))
-                    buf.seek(0)
-                    st.download_button(label='Download overlay Tauc plot (PNG)', data=buf.getvalue(), file_name='tauc_overlay.png', mime='image/png')
-                else:
-                    # Separate per-sample plots (one figure per sample)
-                    for idx, sample_name in enumerate(sample_list):
-                        if sample_name not in tauc_curves:
-                            st.warning(f'No valid data for sample {sample_name}; cannot compute Tauc plot.')
-                            continue
-                        tauc_df_plot = tauc_curves[sample_name]
-                        slope, intercept = fit_params.get(sample_name, (np.nan, np.nan))
-                        color = cmap(idx / max(num_samples - 1, 1)) if num_samples > 1 else cmap(0)
-                        fig = plot_tauc_curve(
-                            tauc_df_plot.sort_values('E (eV)'),
-                            sample_name,
-                            (slope, intercept),
-                            float(bandgap_df.loc[bandgap_df['Sample'] == sample_name, 'Eg (eV)'].values[0]) if not bandgap_df.empty else np.nan,
-                            color,
-                            line_style,
-                            line_width,
-                            marker,
-                            legend_loc,
-                            show_grid,
-                            (fig_width, fig_height),
-                            int(dpi),
-                        )
-                        st.pyplot(fig)
-                        buf = io.BytesIO()
-                        fig.savefig(buf, format='png', dpi=300)
-                        buf.seek(0)
-                        st.download_button(label=f'Download Tauc plot for {sample_name}', data=buf.getvalue(), file_name=f'tauc_{sample_name.replace(" ","_").lower()}.png', mime='image/png')
+                # Discover available measurement columns for this sample
+                meas_cols = [col for col in merged_data.columns if col[0] == s]
+                meas_names = [c[1] for c in meas_cols]
+                if not meas_names:
+                    continue
+                with st.expander(f'{s} — data / choose measurement', expanded=False):
+                    chosen = st.selectbox(f'Choose measurement column for {s}', options=meas_names, index=0, key=f'meas_{s}')
+                    chosen_col = (s, chosen)
+                    thickness_nm = st.number_input(f'Thickness for {s} (nm, 0 = unknown)', min_value=0.0, value=0.0, step=1.0, key=f'thick_{s}')
+                    use_sample = st.checkbox(f'Select {s} for further analysis', value=False, key=f'use_{s}')
+                    if use_sample:
+                        selected_for_tauc.append(s)
+                    try:
+                        meas_series = merged_data[chosen_col].iloc[:int(limit_rows)].astype(float).reset_index(drop=True)
+                    except Exception:
+                        meas_series = pd.Series([np.nan] * len(wavelengths))
+                    name_lower = str(chosen).lower()
+                    is_trans = any(tok in name_lower for tok in ['%t', 't%', 'trans', 'transmittance', 'transmission'])
+                    is_refl = any(tok in name_lower for tok in ['%r', 'r%', 'reflect', 'reflectance'])
+                    if is_trans:
+                        meas_frac = meas_series / 100.0
+                        meas_frac = meas_frac.where(meas_frac > 0, np.nan)
+                        if thickness_nm and thickness_nm > 0:
+                            d_m = thickness_nm * 1e-9
+                            with np.errstate(divide='ignore', invalid='ignore'):
+                                alpha_vals = -np.log(meas_frac) / d_m
+                            alpha_name = 'Absorption coefficient (1/m)'
+                        else:
+                            with np.errstate(divide='ignore', invalid='ignore'):
+                                alpha_vals = -np.log(meas_frac)
+                            alpha_name = '-ln(T) (unitless)'
+                    elif is_refl:
+                        R = meas_series / 100.0
+                        R_safe = R.where(R > 0, np.nan)
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            alpha_vals = ((1.0 - R_safe) ** 2) / (2.0 * R_safe)
+                        alpha_name = 'F(R)'
+                    else:
+                        alpha_vals = meas_series
+                        alpha_name = 'Value'
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        energy = 1240.0 / wavelengths
+                    display_df = pd.DataFrame({
+                        'Wavelength (nm)': wavelengths,
+                        chosen: meas_series,
+                        alpha_name: pd.Series(alpha_vals).reset_index(drop=True),
+                        'Energy (eV)': energy,
+                    })
+                    st.write('Preview table (first 200 rows):')
+                    st.dataframe(display_df.head(200))
+                    csv_buf = io.StringIO()
+                    display_df.to_csv(csv_buf, index=False)
+                    st.download_button(label=f'Download computed table for {s} (CSV)', data=csv_buf.getvalue(), file_name=f'computed_{s}.csv', mime='text/csv', key=f'dl_{s}')
+            st.session_state['selected_for_tauc'] = selected_for_tauc
+            st.info('Per-sample computed tables shown above. Use the checkboxes to mark which samples to include in subsequent analyses.')
 
 
 if __name__ == '__main__':
