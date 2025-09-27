@@ -2342,8 +2342,10 @@ def main() -> None:
                         st.session_state['tauc_fits'] = {}
                     fit_method = st.sidebar.selectbox('Fit method', options=['Automatic', 'Manual'], index=0, key='tauc_fit_method')
                     threshold_fraction = st.sidebar.slider('Threshold fraction (auto)', min_value=0.01, max_value=0.5, value=0.1, step=0.01, key='tauc_threshold')
-                    manual_e_min = st.sidebar.number_input('Manual fit E min (eV)', value=float(0.5), step=0.01, key='tauc_manual_min')
-                    manual_e_max = st.sidebar.number_input('Manual fit E max (eV)', value=float(3.5), step=0.01, key='tauc_manual_max')
+                    # Manual selection sliders (Option C.1)
+                    e_min_slider, e_max_slider = st.sidebar.slider('Manual energy window (eV)', min_value=float(0.0), max_value=float(6.0), value=(0.5, 3.5), step=0.01, key='tauc_manual_slider')
+                    manual_e_min = st.sidebar.number_input('Manual fit E min (eV)', value=float(e_min_slider), step=0.01, key='tauc_manual_min')
+                    manual_e_max = st.sidebar.number_input('Manual fit E max (eV)', value=float(e_max_slider), step=0.01, key='tauc_manual_max')
                     show_fit_lines = st.sidebar.checkbox('Show fit lines', value=True, key='tauc_show_fit')
                     show_eg = st.sidebar.checkbox('Show E_g annotations', value=True, key='tauc_show_eg')
                     for idx, s in enumerate(chosen_plot_samples):
@@ -2366,6 +2368,7 @@ def main() -> None:
                         if fit_method == 'Automatic':
                             slope, intercept, Eg, r2, used_mask = fit_tauc_line(energies_arr, y_arr, method='auto', threshold_fraction=float(threshold_fraction))
                         else:
+                            # Manual: respect the slider/inputs
                             slope, intercept, Eg, r2, used_mask = fit_tauc_line(energies_arr, y_arr, method='manual', energy_window=(manual_e_min, manual_e_max))
                         st.session_state['tauc_fits'][s] = {'slope': slope, 'intercept': intercept, 'Eg': Eg, 'R2': r2, 'used_mask': used_mask}
                         # Draw fit line and Eg marker
@@ -2391,7 +2394,22 @@ def main() -> None:
                     else:
                         ax.set_xlim(float(tauc_xmin), float(tauc_xmax))
                         ax.set_ylim(float(tauc_ymin), float(tauc_ymax))
-                    st.pyplot(fig)
+                    # If Plotly is available, provide an interactive preview for manual selection
+                    if go is not None and px is not None:
+                        # Build a Plotly figure mirroring the Matplotlib one but interactive
+                        plotly_fig = go.Figure()
+                        for idx, s in enumerate(chosen_plot_samples):
+                            df_t = tauc_tables_local[s].dropna(subset=['Energy (eV)', 'Alpha_hv_n']).reset_index(drop=True)
+                            if df_t.empty:
+                                continue
+                            plotly_fig.add_trace(go.Scatter(x=df_t['Energy (eV)'], y=df_t['Alpha_hv_n'], mode='lines+markers' if tauc_marker!='None' else 'lines', name=s, line=dict(color='rgba'+str(tuple((colours[idx%len(colours)].tolist()))) )))
+                        # Highlight selected manual window if Manual mode
+                        if fit_method != 'Automatic':
+                            plotly_fig.add_vrect(x0=manual_e_min, x1=manual_e_max, fillcolor='LightSalmon', opacity=0.2, layer='below', line_width=0)
+                        plotly_fig.update_layout(title='Tauc plot (interactive preview)', xaxis_title='Photon energy (eV)', yaxis_title=f'(α·hν)^{{{tauc_exponent}}} (a.u.)')
+                        st.plotly_chart(plotly_fig, use_container_width=True)
+                    else:
+                        st.pyplot(fig)
                     buf = io.BytesIO()
                     fig.savefig(buf, format='png', dpi=int(dpi))
                     buf.seek(0)
