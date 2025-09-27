@@ -47,6 +47,14 @@ try:
 except Exception:  # pragma: no cover - environment dependent
     plt = None
 
+# Optional Plotly for interactive selection (guarded)
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+except Exception:
+    go = None
+    px = None
+
 try:
     from scipy.signal import savgol_filter, find_peaks
 except Exception:  # pragma: no cover - environment dependent
