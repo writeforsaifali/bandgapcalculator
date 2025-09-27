@@ -2411,6 +2411,12 @@ def main() -> None:
                             linewidth=float(tauc_line_width),
                             marker=(None if (tauc_marker == 'None') else tauc_marker),
                         )
+                        # Highlight points used in the fit
+                        try:
+                            if np.any(sel_used):
+                                ax.plot(energies_arr[sel_used], sel_y[sel_used], linestyle='None', marker='o', markersize=6, markerfacecolor='none', markeredgecolor=colours[idx % len(colours)])
+                        except Exception:
+                            pass
                         # Store fit info
                         st.session_state['tauc_fits'][s] = {'slope': slope, 'intercept': intercept, 'Eg': Eg, 'R2': r2, 'used_mask': sel_used, 'n': chosen_exp}
                         # Draw fit line and Eg marker
@@ -2420,7 +2426,9 @@ def main() -> None:
                             ax.plot(xfit, yfit, linestyle='--', color='red', linewidth=1.2)
                         if show_eg and np.isfinite(Eg):
                             ax.axvline(Eg, color='k', linestyle=':', linewidth=1.0)
-                            ax.text(Eg, 0.95 * np.nanmax(sel_y), f'Eg={Eg:.3f} eV', rotation=90, va='top', ha='center', bbox=dict(facecolor='white', alpha=0.7, lw=0))
+                            # place text slightly above the max plotted y for this sample
+                            y_anno = 0.95 * np.nanmax(sel_y) if np.isfinite(np.nanmax(sel_y)) else 0
+                            ax.text(Eg, y_anno, f'Eg={Eg:.3f} eV', rotation=90, va='bottom', ha='center', bbox=dict(facecolor='white', alpha=0.7, lw=0))
 
                         # Prepare plotly trace
                         plotly_traces.append((s, energies_arr, sel_y, colours[idx % len(colours)], chosen_exp, sel_used, slope, intercept, Eg, r2))
@@ -2460,8 +2468,14 @@ def main() -> None:
                         st.plotly_chart(plotly_fig, use_container_width=True)
                     else:
                         st.pyplot(fig)
+                    # Shade manual window on Matplotlib if Manual mode
+                    try:
+                        if fit_method != 'Automatic':
+                            ax.axvspan(float(manual_e_min), float(manual_e_max), color='lightcoral', alpha=0.12)
+                    except Exception:
+                        pass
                     buf = io.BytesIO()
-                    fig.savefig(buf, format='png', dpi=int(dpi))
+                    fig.savefig(buf, format='png', dpi=int(dpi), bbox_inches='tight')
                     buf.seek(0)
                     st.download_button('Download Tauc overlay (PNG)', data=buf.getvalue(), file_name='tauc_overlay.png', mime='image/png')
 
